@@ -4,12 +4,13 @@
 #
 # Usage:
 #   sudo ./setup-dante.sh [--port PORT] [--iface IFACE] [--allow CIDR[,CIDR...]]
-#                         [--creds-file PATH] [--no-force-ipv4]
+#                         [--creds-file PATH] [--no-auth] [--no-force-ipv4]
 #
 # Examples:
 #   sudo ./setup-dante.sh
 #   sudo ./setup-dante.sh --port 1080 --allow 203.0.113.0/24,198.51.100.7/32
 #   sudo ./setup-dante.sh --iface ens3 --creds-file ./proxy.txt
+#   sudo ./setup-dante.sh --no-auth --allow 203.0.113.7/32
 #
 # Notes:
 #   * socksmethod is "username": a random username and password are generated
@@ -18,6 +19,9 @@
 #     directory, mode 600, owned by the user who ran sudo).
 #   * Only the generated user may use the proxy; other system accounts are
 #     rejected. --allow still limits which client IPs may connect at all.
+#   * --no-auth disables user/password (socksmethod "none"), removes the
+#     previously generated user and its creds file. Restrict access with
+#     --allow and/or a firewall — an open proxy WILL be abused within hours.
 #   * Idempotent: re-running updates the config, replaces the previously
 #     generated proxy user with a fresh one, and restarts the service.
 #   * Forces IPv4 by default: sets glibc resolver precedence so Dante never
@@ -30,6 +34,7 @@ PORT=1080
 IFACE=""
 ALLOW="0.0.0.0/0"
 FORCE_IPV4=1
+AUTH=1
 CONF=/etc/danted.conf
 CREDS_FILE="./dante-credentials.txt"
 USER_TAG="dante-proxy"   # GECOS marker so re-runs only delete users we created
@@ -41,9 +46,10 @@ while [[ $# -gt 0 ]]; do
     --iface) IFACE="$2"; shift 2 ;;
     --allow) ALLOW="$2"; shift 2 ;;
     --creds-file) CREDS_FILE="$2"; shift 2 ;;
+    --no-auth) AUTH=0; shift ;;
     --no-force-ipv4) FORCE_IPV4=0; shift ;;
     -h|--help)
-      sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+      sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 1 ;;
   esac
 done
@@ -71,6 +77,7 @@ fi
 echo ">> Using interface: $IFACE"
 echo ">> Listening port:  $PORT"
 echo ">> Allowed clients: $ALLOW"
+echo ">> Authentication:  $([[ "$AUTH" -eq 1 ]] && echo "username/password" || echo "NONE")"
 
 # ---- install ----------------------------------------------------------------
 echo ">> Installing dante-server..."
@@ -108,16 +115,31 @@ if [[ -f "$CREDS_FILE" ]]; then
   if [[ -n "$OLD_USER" ]] && [[ "$(getent passwd "$OLD_USER" | cut -d: -f5)" == "$USER_TAG" ]]; then
     userdel "$OLD_USER" 2>/dev/null || true
     echo ">> Removed previous proxy user: $OLD_USER"
+    # With auth off nothing replaces it, so drop the now-useless creds file.
+    if [[ "$AUTH" -eq 0 ]]; then
+      rm -f "$CREDS_FILE"
+      echo ">> Removed stale credentials file: $CREDS_FILE"
+    fi
   fi
 fi
 
-# Letters+digits only, so the credentials are safe inside socks5://user:pass@ URLs.
-PROXY_USER="u$(gen_rand 9 'a-z0-9')"
-PROXY_PASS="$(gen_rand 24 'A-Za-z0-9')"
+if [[ "$AUTH" -eq 1 ]]; then
+  # Letters+digits only, so the credentials are safe inside socks5://user:pass@ URLs.
+  PROXY_USER="u$(gen_rand 9 'a-z0-9')"
+  PROXY_PASS="$(gen_rand 24 'A-Za-z0-9')"
 
-useradd --system --no-create-home --shell /usr/sbin/nologin --comment "$USER_TAG" "$PROXY_USER"
-echo "${PROXY_USER}:${PROXY_PASS}" | chpasswd
-echo ">> Created proxy user: $PROXY_USER"
+  useradd --system --no-create-home --shell /usr/sbin/nologin --comment "$USER_TAG" "$PROXY_USER"
+  echo "${PROXY_USER}:${PROXY_PASS}" | chpasswd
+  echo ">> Created proxy user: $PROXY_USER"
+
+  SOCKS_METHOD="username"
+  SOCKS_AUTH_RULE="    socksmethod: username
+    user: ${PROXY_USER}
+"
+else
+  SOCKS_METHOD="none"
+  SOCKS_AUTH_RULE=""
+fi
 
 # ---- write config -----------------------------------------------------------
 if [[ -f "$CONF" ]] && [[ ! -f "${CONF}.orig" ]]; then
@@ -133,7 +155,7 @@ logoutput: syslog /var/log/danted.log
 internal: 0.0.0.0 port = ${PORT}
 external: ${IFACE}
 
-socksmethod: username
+socksmethod: ${SOCKS_METHOD}
 clientmethod: none
 
 user.privileged: root
@@ -142,9 +164,7 @@ user.unprivileged: nobody
 ${CLIENT_RULES}
 socks pass {
     from: 0.0.0.0/0 to: 0.0.0.0/0
-    socksmethod: username
-    user: ${PROXY_USER}
-    log: connect disconnect error
+${SOCKS_AUTH_RULE}    log: connect disconnect error
 }
 
 socks block {
@@ -188,10 +208,12 @@ fi
 SERVER_IP=$(ip -4 -o addr show dev "$IFACE" | awk '{split($4,a,"/"); print a[1]; exit}')
 echo ">> Self-test through the proxy (hostname target, resolver-decided)..."
 if command -v curl >/dev/null 2>&1; then
+  CURL_AUTH=()
+  [[ "$AUTH" -eq 1 ]] && CURL_AUTH=(--proxy-user "${PROXY_USER}:${PROXY_PASS}")
   # No -4 here on purpose: this exercises the same resolution path Dante uses
   # for hostname targets, so it catches the IPv6 problem instead of hiding it.
   if OUT=$(curl -s --max-time 10 --socks5-hostname "127.0.0.1:${PORT}" \
-             --proxy-user "${PROXY_USER}:${PROXY_PASS}" https://ifconfig.me 2>/dev/null); then
+             "${CURL_AUTH[@]}" https://ifconfig.me 2>/dev/null); then
     echo ">> Proxy egress IP: ${OUT}"
     [[ -n "$OUT" ]] && SERVER_IP="$OUT"
   else
@@ -200,8 +222,24 @@ if command -v curl >/dev/null 2>&1; then
   fi
 fi
 
-# ---- save & show credentials -----------------------------------------------
 SERVER_IP="${SERVER_IP:-<server-ip>}"
+
+if [[ "$AUTH" -eq 0 ]]; then
+  cat <<EOF
+
+Done. SOCKS5 proxy listening on port ${PORT} (NO authentication).
+
+Test from a whitelisted client:
+  curl --proxy "socks5h://${SERVER_IP}:${PORT}" https://ifconfig.me
+
+Reminder: with no password, your ONLY protection is the client whitelist
+(${ALLOW}) plus your firewall. Make sure inbound TCP :${PORT} is restricted
+to trusted source IPs.
+EOF
+  exit 0
+fi
+
+# ---- save & show credentials -----------------------------------------------
 PROXY_URL="socks5://${PROXY_USER}:${PROXY_PASS}@${SERVER_IP}:${PORT}"
 
 ( umask 077
