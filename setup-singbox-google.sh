@@ -30,9 +30,9 @@
 #     dead IPv6 route is never tried. Disable with --no-force-ipv4.
 #   * Enables BBR congestion control (via /etc/sysctl.d/99-setup-singbox.conf;
 #     settings the kernel refuses are skipped). Disable with --no-tune.
-#   * Sends Google/Apple domains (WARP_DOMAINS below) to the Cloudflare WARP
-#     SOCKS5 proxy at 127.0.0.1:40000 (warp-cli proxy mode); everything else
-#     goes direct. Change with --warp HOST:PORT, turn off with --no-warp.
+#   * Sends Google AI domains (Gemini, AI Studio, NotebookLM...; WARP_DOMAINS
+#     below) to the Cloudflare WARP SOCKS5 proxy at 127.0.0.1:40000; everything
+#     else goes direct. Change with --warp HOST:PORT, turn off with --no-warp.
 
 set -euo pipefail
 
@@ -46,11 +46,58 @@ CONF=/etc/sing-box/config.json
 CREDS_FILE="./singbox-credentials.txt"
 TAG="setup-singbox-ss"   # inbound tag; marks a config as ours on re-runs
 WARP="127.0.0.1:40000"   # WARP SOCKS5 proxy; empty = off
-# Domains routed through WARP. A suffix also matches every subdomain.
+# Domains routed through WARP. "suffix:NAME" matches NAME and every subdomain
+# (sing-box domain_suffix); a bare NAME matches only that exact host (domain).
 WARP_DOMAINS=(
-  google.com google.com.hk googleapis.com gstatic.com googleusercontent.com
-  ggpht.com gvt1.com gvt2.com withgoogle.com
-  apple.com icloud.com mzstatic.com apple-cloudkit.com
+  suffix:gemini.google.com
+  suffix:gemini.google
+  suffix:gemini.gstatic.com
+  suffix:bard.google.com
+  geminiweb-pa.clients.google.com
+  geminiweb-pa.clients6.google.com
+  suffix:aistudio.google.com
+  suffix:ai.studio
+  suffix:makersuite.google.com
+  suffix:generativeai.google
+  ai.google.dev
+  alkalicore-pa.clients6.google.com
+  alkalimakersuite-pa.clients6.google.com
+  webchannel-alkalimakersuite-pa.clients6.google.com
+  suffix:generativelanguage.googleapis.com
+  suffix:geller-pa.googleapis.com
+  suffix:proactivebackend-pa.googleapis.com
+  suffix:robinfrontend-pa.googleapis.com
+  suffix:deepmind.com
+  suffix:deepmind.google
+  appsgenaiserver-pa.clients.google.com
+  appsgenaiserver-pa.clients6.google.com
+  appsgenaiserver-pa.googleapis.com
+  cloudaicompanion.googleapis.com
+  cloudcode-pa.googleapis.com
+  daily-cloudcode-pa.googleapis.com
+  suffix:aicode.googleapis.com
+  suffix:aida.googleapis.com
+  suffix:notebooklm.google.com
+  suffix:notebooklm.google
+  suffix:notebook.google.com
+  suffix:notebook.google
+  notebooklm-pa.googleapis.com
+  notebooklm.googleapis.com
+  suffix:labstailwind.pa.googleapis.com
+  suffix:jules.google.com
+  suffix:jules.google
+  suffix:labs.google.com
+  suffix:labs.google
+  suffix:flow.google.com
+  suffix:flow.google
+  suffix:aisandbox-pa.googleapis.com
+  suffix:opal.google.com
+  suffix:opal.google
+  antigravity-pa.googleapis.com
+  antigravity.googleapis.com
+  suffix:antigravity.google
+  suffix:antigravity-unleash.goog
+  suffix:stitch.withgoogle.com
 )
 
 # ---- parse args -------------------------------------------------------------
@@ -122,9 +169,9 @@ if [[ -n "$WARP" ]]; then
   if [[ -z "$WARP_HOST" || ! "$WARP_PORT" =~ ^[0-9]+$ ]]; then
     echo "--warp expects HOST:PORT, got: $WARP" >&2; exit 1
   fi
-  # Not fatal: the config is still valid, but Google/Apple fail until WARP is up.
+  # Not fatal: the config is still valid, but WARP domains fail until WARP is up.
   if [[ "$WARP_HOST" == "127.0.0.1" ]] && [[ -z "$(ss -Hltn "sport = :${WARP_PORT}" 2>/dev/null)" ]]; then
-    echo "!! Nothing listens on ${WARP}: Google/Apple traffic will fail until WARP is" >&2
+    echo "!! Nothing listens on ${WARP}: Gemini/AI Studio traffic will fail until WARP is" >&2
     echo "   running (warp-cli mode proxy; warp-cli proxy port ${WARP_PORT}; warp-cli connect)." >&2
   fi
 fi
@@ -197,14 +244,29 @@ if [[ -n "$ALLOW" ]]; then
 fi
 WARP_OUTBOUND=""
 if [[ -n "$WARP" ]]; then
-  DOMAIN_LIST=$(printf '"%s", ' "${WARP_DOMAINS[@]}"); DOMAIN_LIST="${DOMAIN_LIST%, }"
+  # Split WARP_DOMAINS into exact hosts (domain) and suffixes (domain_suffix);
+  # sing-box ORs the two inside one rule.
+  EXACT=(); SUFFIX=()
+  for d in "${WARP_DOMAINS[@]}"; do
+    case "$d" in
+      suffix:*) SUFFIX+=("${d#suffix:}") ;;
+      *)        EXACT+=("$d") ;;
+    esac
+  done
+  MATCH=""
+  if [[ ${#EXACT[@]} -gt 0 ]]; then
+    L=$(printf '"%s", ' "${EXACT[@]}"); MATCH+="\"domain\": [${L%, }], "
+  fi
+  if [[ ${#SUFFIX[@]} -gt 0 ]]; then
+    L=$(printf '"%s", ' "${SUFFIX[@]}"); MATCH+="\"domain_suffix\": [${L%, }], "
+  fi
   # Sniff first: a client that resolved the name itself sends only an IP, and
   # the domain rule below needs the name (TLS SNI / HTTP Host / QUIC).
   RULES+=("{ \"action\": \"sniff\" }")
   # WARP's local proxy is not relied on for UDP: refuse QUIC to these domains
   # so browsers and apps fall back to TCP right away.
-  RULES+=("{ \"domain_suffix\": [${DOMAIN_LIST}], \"network\": \"udp\", \"port\": 443, \"action\": \"reject\" }")
-  RULES+=("{ \"domain_suffix\": [${DOMAIN_LIST}], \"outbound\": \"warp\" }")
+  RULES+=("{ ${MATCH}\"network\": \"udp\", \"port\": 443, \"action\": \"reject\" }")
+  RULES+=("{ ${MATCH}\"outbound\": \"warp\" }")
   WARP_OUTBOUND=",
     { \"type\": \"socks\", \"tag\": \"warp\", \"server\": \"${WARP_HOST}\", \"server_port\": ${WARP_PORT}, \"version\": \"5\" }"
 fi
@@ -356,13 +418,13 @@ else
   sed 's/^/   client: /' "$TEST_DIR/client.log" >&2 || true
 fi
 if [[ -n "$WARP" ]]; then
-  # Through the server, Google should go out via WARP and not bounce to .hk.
-  G_URL=$(curl -sL --max-time 15 -o /dev/null -w '%{url_effective}' \
-            --socks5-hostname "127.0.0.1:${TEST_PORT}" https://www.google.com 2>/dev/null || true)
-  if [[ "$G_URL" == https://www.google.com/* ]]; then
-    echo ">> Google via WARP: ${G_URL} (OK)"
+  # Through the server, gemini.google.com is routed via WARP: it must answer.
+  G_CODE=$(curl -s --max-time 15 -o /dev/null -w '%{http_code}' \
+            --socks5-hostname "127.0.0.1:${TEST_PORT}" https://gemini.google.com/ 2>/dev/null || true)
+  if [[ "$G_CODE" =~ ^[23][0-9][0-9]$ ]]; then
+    echo ">> Gemini via WARP: HTTP ${G_CODE} (OK)"
   else
-    echo "!! Google via WARP: ${G_URL:-request failed}. Check: warp-cli status" >&2
+    echo "!! Gemini via WARP: ${G_CODE:-request failed}. Check: warp-cli status" >&2
   fi
 fi
 kill "$TEST_PID" 2>/dev/null || true
